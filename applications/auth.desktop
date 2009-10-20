@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Categories=X-Alterator-Users
+Icon=auth
+Terminal=false
+Name=Authentication
+X-Alterator-URI=/auth
+X-Alterator-Weight=10
+X-Alterator-Help=auth
+Name[ru]=Аутентификация
+Name[uk]=Аутентифікація

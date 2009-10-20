@@ -1,0 +1,173 @@
+#!/bin/sh
+
+#common part
+po_domain="alterator-auth"
+alterator_api_version=1
+ldap_uri_re='^(ldap|ldapi|ldaps)://[.a-zA-Z0-9_-]+$'
+rdelim='[[:space:]]\+'
+wdelim=' '
+
+#pam configuration
+pamldapfile="/etc/pam_ldap.conf"
+
+#nss configuration
+nssldapfile=
+nssldapfile1="/etc/nss_ldap.conf"
+nssldapfile2="/etc/nss-ldapd.conf"
+nsswitchfile="/etc/nsswitch.conf"
+
+#select between nss_ldap and nss_ldapd
+[ -f "$nssldapfile1" ] && nssldapfile="$nssldapfile1"
+[ -f "$nssldapfile2" ] && nssldapfile="$nssldapfile2"
+
+
+. alterator-sh-functions
+. shell-config
+. shell-quote
+
+#turn off auto expansion
+set -f
+
+host_2_dn()
+{
+    local host="$1" ; shift
+    host="$(echo $host|sed -e "s/^/dc=/"|sed -e "s/\./,dc=/g")"
+    echo "$host"
+}
+
+local_bases(){
+    if [ -n "$in_ldap_host" ]; then
+	if test_bool "$in_ldap_ssl"; then 
+	    ldap_uri="ldaps://" 
+	else 
+	    ldap_uri="ldap://"
+	fi
+	echo "$in_ldap_ssl: $ldap_uri$in_ldap_host" >> /root/alt_test.txt
+    	ldapsearch -x -H "$ldap_uri$in_ldap_host" -LLL -b "" -s base namingContexts | grep naming | cut -f2 -d ' '| \
+        while read base_dn ; do
+    	    write_enum_item "$base_dn" "$base_dn"
+        done 2>/dev/null
+    else
+	ldap-dn list | while read basedn configfile;do
+	    write_enum_item "$basedn" "$basedn"
+	done
+    fi
+}
+
+list_domain()
+{
+	local __ prefix ip txt role domain
+
+	write_enum_item "local" "$(_ "local")"
+	avahi-browse -prtk _server._tcp 2>/dev/null|
+		while IFS=';' read prefix __ __ __ __ __ __ ip __ txt; do
+			[ "$prefix" = "=" ] || continue
+			role="$(txt_record role "$txt")"
+			[ "$role" = "master" ] || continue
+			domain="$(txt_record domain "$txt")"
+        		write_enum_item "$domain" "$domain ($ip)"
+		done
+#    write_enum_item "custom" "$(_ "custom")"
+}
+
+txt_record()
+{
+	echo "$2" |
+		sed -n "s/\(^\|.*[[:space:]]\)\"$(quote_sed_regexp "$1")=\([^\"]*\)\".*/\2/p"
+}
+
+dn_2_host()
+{
+    local dn="$1"
+    local host=
+
+    echo "$dn"|sed -e 's/^dc=//i'|sed -e 's/,dc=/\./g'
+}
+
+read_current()
+{
+    local data="$(/usr/sbin/system-auth status)"
+    local status="$(echo "$data"|cut -f1 -d' ')"
+    local dn
+
+    [ "$status" = "krb5" ] \
+	&& dn="$(echo "$data"|cut -f2 -d' ')" \
+	&& dn_2_host "$dn" \
+	&& return
+
+    echo "Kerberos domain do not used"
+}
+
+read_ldap()
+{
+    shell_config_get "$1" "$2" "$rdelim"
+}
+
+read_ldap2()
+{
+    read_ldap "$pamldapfile" "$1"
+}
+
+get_ldap()
+{
+		local ldap_uri="$(read_ldap2 uri)"
+
+		local ldap_proto="${ldap_uri%%://*}"
+		local ldap_host="${ldap_uri#$ldap_proto://}"
+		local ldap_port="${ldap_host##*:}"
+
+		ldap_host="${ldap_host%%:*}"
+		[ "$ldap_port" != "$ldap_host" ] || ldap_port=
+
+		write_string_param ldap_host "$ldap_host"
+		#write_string_param ldap_port "$ldap_port"
+
+		[ "$ldap_proto" != "ldaps" ]
+		write_bool_param ldap_ssl "$?"
+
+		write_string_param ldap_basedn "$(read_ldap2 base)"
+}
+
+on_message()
+{
+	case "$in_action" in
+	    type)
+    		write_type_item domain_name hostname
+    		write_type_item domain hostname
+		;;
+	    list)
+		[ "$in__objects" = "avail_domain" ] && list_domain
+		[ "$in__objects" = "local_bases" ] && local_bases
+		;;
+	    read)
+		write_string_param "auth_type" "$(/usr/sbin/system-auth status |cut -f1 -d ' ')"
+		get_ldap
+    		write_string_param current_domain "$(read_current)"
+		;;
+	    write)
+		case "$in_auth_type" in
+		local)
+		    /usr/sbin/system-auth write local
+		;;
+		ldap)
+		    [ -z "$in_ldap_ssl" ] && ldap_uri="ldap://" || ldap_uri="ldaps://"
+		    /usr/sbin/system-auth write ldap "$in_ldap_basedn" "$ldap_uri$in_ldap_host"
+		;;
+		krb5)
+		    if [ "$in_domain" = "local" ]; then
+			/usr/sbin/system-auth write local
+		    else
+			[ -n "$in_domain" ] && /usr/sbin/system-auth write krb5 "$(host_2_dn "$in_domain")" ldap://ldap."$in_domain" || fatal "$(_ "Domain not set")"		    
+		    fi
+		;;
+		multi)
+		;;
+		pkcs11)
+		;;
+		*)
+		;;
+		esac
+		;;
+	esac
+}
+message_loop

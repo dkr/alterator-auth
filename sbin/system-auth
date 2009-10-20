@@ -1,0 +1,240 @@
+#!/bin/sh
+
+rdelim='[[:space:]]\+'
+wdelim=' '
+
+#pam configuration
+pamldapfile="/etc/pam_ldap.conf"
+
+#nss configuration
+nssldapfile=
+nssldapfile1="/etc/nss_ldap.conf"
+nssldapfile2="/etc/nss-ldapd.conf"
+nsswitchfile="/etc/nsswitch.conf"
+
+#openldap conf
+ldap_conf="/etc/openldap/ldap.conf"
+
+# krb conf
+krb5_conf="/etc/krb5.conf"
+
+#select between nss_ldap and nss_ldapd
+[ -f "$nssldapfile1" ] && nssldapfile="$nssldapfile1"
+[ -f "$nssldapfile2" ] && nssldapfile="$nssldapfile2"
+
+. shell-config
+. shell-quote
+. shell-error
+
+#turn off auto expansion
+set -f
+
+# getting current auth
+get_status()
+{
+    local status="$(/usr/sbin/control system-auth)"
+
+    case "$status" in
+        local) 
+            echo "local"
+        ;;
+        ldap)
+            echo -n "ldap " && pam_ldap_info
+        ;;
+        krb5)
+            echo -n "krb5 " && pam_ldap_info
+        ;;
+        *)
+            echo "unknown status"
+        ;;
+    esac
+}
+
+list()
+{
+    # always local
+    echo "local" 
+   
+    # checking pam_ldap and libnss_ldap libs
+    [ -n "$(find /$(getconf SLIB)/security -maxdepth 1 -name 'pam_ldap.*')" ] &&
+	[ -n "$(find /$(getconf SLIB) -maxdepth 1 -name 'libnss_ldap.so.*')" ] &&
+    echo "ldap"
+   
+    # checking ldap and krb5 libs
+    [ -n "$(find /$(getconf SLIB)/security -maxdepth 1 -name 'pam_ldap.*')" ] &&
+	[ -n "$(find /$(getconf SLIB) -maxdepth 1 -name 'libnss_ldap.so.*')" ] &&
+	[ -n "$(find /$(getconf SLIB) -maxdepth 1 -name 'libkrb5.so.*')" ] &&
+	echo "krb5" 
+}
+
+pam_ldap_info()
+{
+    local uri basedn
+
+    uri="$(read_pam_ldap uri)"
+    basedn="$(read_pam_ldap base)"
+
+    check_uri "$uri" && check_basedn "$basedn" && echo "$basedn $uri" 
+}
+
+check_uri()
+{
+    local uri="$1"
+
+    [ -z "$uri" ] && message "$0 (check_uri) uri not set" && return 1
+
+    [ -z "$(echo "$uri"| egrep "^ldap[s|i]?:\/\/[^\/]+/?$")" ] && message "$0 (check_uri) invalid uri format" && return 1
+
+    :
+}
+
+check_basedn()
+{
+    local basedn="$1"
+
+    [ -z "$basedn" ] && message "$0 (check_basedn) basedn not set" && return 1
+    
+    [ -z "$(echo "$basedn"| egrep "^dc=[^,]+(,dc=[^,]+)*$")" ] && message "$0 (check_basedn) invalid basedn format" && return 1
+
+    :
+}
+
+read_pam_ldap()
+{
+    read_config "$pamldapfile" "$1"
+}
+
+read_config()
+{
+    shell_config_get "$1" "$2" "$rdelim"
+}
+
+
+write_profile()
+{
+    /usr/sbin/control system-auth "$1" &&
+    case "$1" in
+	local)
+	    write_nsswitch "passwd" "files"
+	    write_nsswitch "shadow" "tcb files"
+	    write_nsswitch "group" "files"
+	    ;;
+	ldap)
+	    write_nsswitch "passwd" "files ldap"
+	    write_nsswitch "shadow" "tcb files ldap"
+	    write_nsswitch "group" "files ldap"
+	    ;;
+	krb5)
+	    write_nsswitch "passwd" "files ldap"
+	    write_nsswitch "shadow" "tcb files ldap"
+	    write_nsswitch "group" "files ldap"
+	    ;;
+    esac
+}
+
+write_nsswitch()
+{
+    write_config "$nsswitchfile" "$1:" "$2" 
+}
+
+write_2_ldap()
+{
+    write_pam_ldap "$1" "$2"
+    write_nss_ldap "$1" "$2"
+    write_ldap_conf "$1" "$2"
+}
+
+write_pam_ldap()
+{
+    write_config "$pamldapfile" "$1" "$2"
+}
+
+write_nss_ldap()
+{
+    write_config "$nssldapfile" "$1" "$2"
+}
+
+write_ldap_conf()
+{
+    # ugly, but effective
+    sed -r -i -e "/^[^#]*$1.*$/Id" "$ldap_conf"
+    echo "$1 $2" >> "$ldap_conf"
+}
+
+write_config()
+{
+    shell_config_set "$1" "$2" "$3" "$rdelim" "$wdelim"
+}
+
+dn_2_host()
+{
+    local dn="$1"
+
+    echo "$dn"|sed -e 's/^dc=//i'|sed -e 's/,dc=/\./g'
+}
+
+
+remove_host_from_confs()
+{
+    del_from_conf_var "$pamldapfile" "host" && del_from_conf_var "$nssldapfile" "host"
+}
+
+del_from_conf_var()
+{
+    shell_config_del "$1" "$2" "$rdelim"
+}
+
+
+#initial settings
+init()
+{
+    # removing host parameter from pam_ldap_conf
+    remove_host_from_confs
+    [ ! -s "$nssldapfile1" ] || write_config "$nssldapfile1" bind_policy soft
+    [ ! -s "$nssldapfile1" ] || write_config "$nssldapfile1" bind_timelimit 30
+}
+
+action="$1" ; shift
+[ $# -ge 1 ] && object="$1" && shift
+
+case "$action" in
+    status)
+        get_status
+    ;;
+    list)
+        list
+    ;;
+    write)
+    case "$object" in
+        local)
+            write_profile "$object"
+        ;;
+        ldap)
+        if  check_basedn "$1" && check_uri "$2"  ;then
+            init
+            write_profile "$object"
+            write_2_ldap base "$1"
+            write_2_ldap uri "$2"
+        else
+            exit 1
+        fi
+        ;;
+        krb5)
+        if  check_basedn "$1" && check_uri "$2" ;then
+            init
+            write_profile "$object"
+            write_2_ldap base "$1"
+            write_2_ldap uri "$2"
+        else
+            exit 1
+        fi
+        ;;
+        *)
+            fatal "unknown auth type $object"
+        ;;
+    esac
+    ;;
+    *)
+        echo "$0 action [object]"
+    ;;
+esac
